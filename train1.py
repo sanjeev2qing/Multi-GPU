@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
-import argparse
 import os
+import argparse
 from collections import OrderedDict
 from itertools import product
 
@@ -15,6 +15,8 @@ from torchvision import transforms
 from sklearn.cluster import KMeans
 from sklearn.neighbors import KernelDensity
 import torch.nn as nn
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 
 from models import (
     Model_cnn_mlp,
@@ -31,7 +33,10 @@ def parse():
     parser.add_argument('--local_rank', type=int, default=0,help='node rank for distributed training')
     args = parser.parse_args()
     return args
-
+#tos.environ['MASTER_ADDR'] = 'localhost'
+#os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+#os.environ['MASTER_PORT'] = '5678'
+#os.environ['LOCAL_RANK'] = '0'
 DATASET_PATH = "dataset"
 SAVE_DATA_DIR = "output"  # for models/data
 
@@ -40,49 +45,50 @@ EXPERIMENTS = [
         "exp_name": "diffusion",
         "model_type": "diffusion",
         "drop_prob": 0.0,
-    },
-    {
-        "exp_name": "mse",
-        "model_type": "mse",
-        "drop_prob": 0.0,
-    },
-    {
-        "exp_name": "discrete",
-        "model_type": "discrete",
-        "drop_prob": 0.0,
-    },
-    {
-        "exp_name": "meanvariance",
-        "model_type": "meanvariance",
-        "drop_prob": 0.0,
-    },
-    {
-        "exp_name": "kmeans",
-        "model_type": "kmeans",
-        "drop_prob": 0.0,
-    },
-    {
-        "exp_name": "bet",
-        "model_type": "bet",
-        "drop_prob": 0.0,
-    },
-    {
-        "exp_name": "cfg",
-        "model_type": "diffusion",
-        "drop_prob": 0.1,
-    },
-    {
-        "exp_name": "ebm_derivative_free",
-        "model_type": "ebm",
-        "sample_mode": "derivative_free",
-        "drop_prob": 0.0,
-    },
-    {
-        "exp_name": "ebm_langevin",
-        "model_type": "ebm",
-        "sample_mode": "langevin",
-        "drop_prob": 0.0,
-    },
+    }
+    # ,
+    # {
+    #     "exp_name": "mse",
+    #     "model_type": "mse",
+    #     "drop_prob": 0.0,
+    # },
+    # {
+    #     "exp_name": "discrete",
+    #     "model_type": "discrete",
+    #     "drop_prob": 0.0,
+    # },
+    # {
+    #     "exp_name": "meanvariance",
+    #     "model_type": "meanvariance",
+    #     "drop_prob": 0.0,
+    # },
+    # {
+    #     "exp_name": "kmeans",
+    #     "model_type": "kmeans",
+    #     "drop_prob": 0.0,
+    # },
+    # {
+    #     "exp_name": "bet",
+    #     "model_type": "bet",
+    #     "drop_prob": 0.0,
+    # },
+    # {
+    #     "exp_name": "cfg",
+    #     "model_type": "diffusion",
+    #     "drop_prob": 0.1,
+    # },
+    # {
+    #     "exp_name": "ebm_derivative_free",
+    #     "model_type": "ebm",
+    #     "sample_mode": "derivative_free",
+    #     "drop_prob": 0.0,
+    # },
+    # {
+    #     "exp_name": "ebm_langevin",
+    #     "model_type": "ebm",
+    #     "sample_mode": "langevin",
+    #     "drop_prob": 0.0,
+    # },
 ]
 
 EXTRA_DIFFUSION_STEPS = [0, 2, 4, 8, 16, 32]
@@ -90,6 +96,7 @@ GUIDE_WEIGHTS = [0.0, 4.0, 8.0]
 
 n_epoch = 100
 lrate = 1e-4
+#device = "cuda:0,1,2,3"
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu' )
 n_hidden = 512
 batch_size = 32
@@ -146,8 +153,9 @@ def train_claw(experiment, n_epoch, lrate, device, n_hidden, batch_size, n_T, ne
     torch_data_train = ClawCustomDataset(
         DATASET_PATH, transform=tf, train_or_test="train", train_prop=0.90
     )
+    train_sampler = DistributedSampler(torch_data_train)
     dataload_train = DataLoader(
-        torch_data_train, batch_size=batch_size, shuffle=True, num_workers=0
+        torch_data_train, sampler=train_sampler, batch_size=batch_size, num_workers=4
     )
 
     x_shape = torch_data_train.image_all.shape[1:]
@@ -273,8 +281,7 @@ def train_claw(experiment, n_epoch, lrate, device, n_hidden, batch_size, n_T, ne
     else:
         raise NotImplementedError
 
-    
-    model = nn.DataParallel(model)
+    model = nn.DataParallel(model, device_ids=[0, 1])
     model.to(device)
     optim = torch.optim.Adam(model.parameters(), lr=lrate)
 
@@ -287,11 +294,13 @@ def train_claw(experiment, n_epoch, lrate, device, n_hidden, batch_size, n_T, ne
 
         # train loop
         pbar = tqdm(dataload_train)
+        train_sampler.set_epoch(ep) 
         loss_ep, n_batch = 0, 0
         for x_batch, y_batch in pbar:
             x_batch = x_batch.type(torch.FloatTensor).to(device)
             y_batch = y_batch.type(torch.FloatTensor).to(device)
-            loss = model.module.loss_on_batch(x_batch, y_batch).to(device)
+            loss = model.module.loss_on_batch(x_batch, y_batch)
+            loss.to(device)
             optim.zero_grad()
             loss.backward()
             loss_ep += loss.detach().item()
@@ -375,9 +384,9 @@ def train_claw(experiment, n_epoch, lrate, device, n_hidden, batch_size, n_T, ne
 
 if __name__ == "__main__":
     args = parse()
-    #device = torch.device(f'cuda:{args.local_rank}')
-    #os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
     os.makedirs(SAVE_DATA_DIR, exist_ok=True)
+    #torch.distributed.init_process_group('nccl', init_method='env://',rank=1 ,world_size=12)
     torch.distributed.init_process_group('nccl', init_method='env://')
     for experiment in EXPERIMENTS:
         train_claw(experiment, n_epoch, lrate, device, n_hidden, batch_size, n_T, net_type, EXTRA_DIFFUSION_STEPS, GUIDE_WEIGHTS)
+
